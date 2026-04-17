@@ -777,6 +777,7 @@ export function RomanticMobileApp() {
         });
 
         if (!error) {
+          setAuthMessage("Успешный вход.");
           return;
         }
 
@@ -786,20 +787,8 @@ export function RomanticMobileApp() {
         }
 
         if (/Invalid login credentials/i.test(error.message)) {
-          const signUp = await supabase.auth.signUp({
-            email: cleanEmail,
-            password: authPassword,
-            options: {
-              emailRedirectTo: authRedirectUrl,
-            },
-          });
-
-          if (signUp.error) {
-            throw signUp.error;
-          }
-
           setAuthMessage(
-            "Аккаунт создан. Подтверди email по ссылке из письма и затем войди снова.",
+            "Неверный email или пароль. Если аккаунта нет, используй 'Отправить magic link' для регистрации/входа.",
           );
           return;
         }

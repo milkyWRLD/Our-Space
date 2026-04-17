@@ -1,4 +1,5 @@
 create extension if not exists "pgcrypto";
+set check_function_bodies = off;
 
 create or replace function public.is_couple_member(target_couple_id uuid)
 returns boolean
@@ -528,3 +529,5 @@ for update
 to authenticated
 using (to_user = auth.uid())
 with check (to_user = auth.uid());
+
+set check_function_bodies = on;
