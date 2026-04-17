@@ -1,5 +1,5 @@
-import { OurSpaceApp } from "@/components/app/our-space-app";
+import { RomanticMobileApp } from "@/components/app/romantic-mobile-app";
 
 export default function Home() {
-  return <OurSpaceApp />;
+  return <RomanticMobileApp />;
 }
