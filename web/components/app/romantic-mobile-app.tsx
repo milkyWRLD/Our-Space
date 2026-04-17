@@ -131,6 +131,18 @@ export function RomanticMobileApp() {
     longitude: "",
   });
   const [formError, setFormError] = useState("");
+  const authRedirectUrl = useMemo(() => {
+    const fromEnv = process.env.NEXT_PUBLIC_APP_URL?.trim();
+    if (fromEnv) {
+      return fromEnv;
+    }
+
+    if (typeof window !== "undefined") {
+      return window.location.origin;
+    }
+
+    return undefined;
+  }, []);
 
   const plannedWishes = wishes.filter((item) => item.status === "planned");
   const doneWishes = wishes.filter((item) => item.status === "done");
@@ -361,6 +373,27 @@ export function RomanticMobileApp() {
 
     return () => subscription.unsubscribe();
   }, [bootstrapFromSession, supabase]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const params = new URLSearchParams(window.location.search);
+    const errorCode = params.get("error_code");
+    const description = params.get("error_description");
+
+    if (!errorCode) {
+      return;
+    }
+
+    if (errorCode === "otp_expired") {
+      setAuthMessage("Ссылка подтверждения истекла. Запроси новую и открой ее сразу.");
+      return;
+    }
+
+    setAuthMessage(description ?? `Ошибка авторизации: ${errorCode}`);
+  }, []);
 
   useEffect(() => {
     if (!supabase || !coupleId) {
@@ -743,16 +776,35 @@ export function RomanticMobileApp() {
           password: authPassword,
         });
 
-        if (error) {
+        if (!error) {
+          return;
+        }
+
+        if (/Email not confirmed/i.test(error.message)) {
+          setAuthMessage("Подтверди email из последнего письма и войди снова.");
+          return;
+        }
+
+        if (/Invalid login credentials/i.test(error.message)) {
           const signUp = await supabase.auth.signUp({
             email: cleanEmail,
             password: authPassword,
+            options: {
+              emailRedirectTo: authRedirectUrl,
+            },
           });
 
           if (signUp.error) {
             throw signUp.error;
           }
+
+          setAuthMessage(
+            "Аккаунт создан. Подтверди email по ссылке из письма и затем войди снова.",
+          );
+          return;
         }
+
+        throw error;
       } catch (error) {
         setAuthMessage(
           error instanceof Error ? error.message : "Ошибка входа по паролю.",
@@ -781,8 +833,7 @@ export function RomanticMobileApp() {
         const { error } = await supabase.auth.signInWithOtp({
           email: cleanEmail,
           options: {
-            emailRedirectTo:
-              typeof window !== "undefined" ? window.location.origin : undefined,
+            emailRedirectTo: authRedirectUrl,
           },
         });
 
