@@ -1,16 +1,21 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   Bell,
   CalendarCheck2,
   ChevronRight,
+  Copy,
+  Dices,
+  ExternalLink,
   Heart,
   Home,
   MapPin,
   Plus,
   Search,
   UserRound,
+  X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
@@ -19,6 +24,7 @@ import { cn } from "@/lib/utils";
 
 type Screen = "home" | "add" | "notifications" | "completed" | "map" | "profile";
 type HomeMode = "places" | "wishes";
+type MapMode = "all" | "planned" | "done";
 type WishCategory = "place" | "wish";
 type NotificationType = "miss_you" | "thinking" | "custom" | "wish_done";
 
@@ -31,6 +37,9 @@ type WishItem = {
   link: string;
   latitude: number | null;
   longitude: number | null;
+  imageUrl: string;
+  isPinned: boolean;
+  plannedFor: string | null;
   status: "planned" | "done";
   createdAt: string;
 };
@@ -43,6 +52,12 @@ type NotificationItem = {
   toUser: string;
   createdAt: string;
   readAt: string | null;
+};
+
+type ToastItem = {
+  id: string;
+  title: string;
+  tone: "success" | "error" | "info";
 };
 
 const listVariants = {
@@ -60,21 +75,24 @@ const cardVariants = {
   exit: { opacity: 0, y: -8, scale: 0.98 },
 };
 
+const WishesMap = dynamic(
+  () => import("@/components/app/wishes-map").then((module) => module.WishesMap),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="rounded-[16px] border border-white/60 bg-white/65 p-4 text-center text-sm text-slate-600">
+        Загружаем карту...
+      </div>
+    ),
+  },
+);
+
 async function sha256Hex(value: string) {
   const bytes = new TextEncoder().encode(value);
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   return Array.from(new Uint8Array(digest))
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
-}
-
-function projectLatLngToCanvas(lat: number, lng: number) {
-  const x = ((lng + 180) / 360) * 100;
-  const y = ((90 - lat) / 180) * 100;
-  return {
-    x: Math.min(94, Math.max(6, x)),
-    y: Math.min(88, Math.max(10, y)),
-  };
 }
 
 const initialCards: WishItem[] = [
@@ -87,6 +105,9 @@ const initialCards: WishItem[] = [
     link: "",
     latitude: 43.5853,
     longitude: 39.7231,
+    imageUrl: "",
+    isPinned: false,
+    plannedFor: null,
     status: "planned",
     createdAt: new Date().toISOString(),
   },
@@ -99,6 +120,9 @@ const initialCards: WishItem[] = [
     link: "",
     latitude: 48.8566,
     longitude: 2.3522,
+    imageUrl: "",
+    isPinned: false,
+    plannedFor: null,
     status: "planned",
     createdAt: new Date().toISOString(),
   },
@@ -114,13 +138,23 @@ export function RomanticMobileApp() {
   const [userId, setUserId] = useState<string | null>(null);
   const [authEmail, setAuthEmail] = useState("");
   const [authPassword, setAuthPassword] = useState("");
+  const [authDisplayName, setAuthDisplayName] = useState("");
+  const [authTab, setAuthTab] = useState<"signin" | "signup">("signin");
   const [isLoading, setIsLoading] = useState(false);
   const [authMessage, setAuthMessage] = useState("");
   const [inviteCode, setInviteCode] = useState("");
+  const [inviteLink, setInviteLink] = useState("");
   const [joinCode, setJoinCode] = useState("");
   const [inviteMessage, setInviteMessage] = useState("");
   const [partnerUserId, setPartnerUserId] = useState<string | null>(null);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
+  const [selectedWish, setSelectedWish] = useState<WishItem | null>(null);
+  const [randomWish, setRandomWish] = useState<WishItem | null>(null);
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [imagePreviewUrl, setImagePreviewUrl] = useState("");
+  const [mapMode, setMapMode] = useState<MapMode>("all");
+  const [loadError, setLoadError] = useState("");
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [form, setForm] = useState({
     title: "",
     description: "",
@@ -129,6 +163,7 @@ export function RomanticMobileApp() {
     link: "",
     latitude: "",
     longitude: "",
+    plannedFor: "",
   });
   const [formError, setFormError] = useState("");
   const authRedirectUrl = useMemo(() => {
@@ -144,7 +179,14 @@ export function RomanticMobileApp() {
     return undefined;
   }, []);
 
-  const plannedWishes = wishes.filter((item) => item.status === "planned");
+  const plannedWishes = wishes
+    .filter((item) => item.status === "planned")
+    .sort((left, right) => {
+      if (left.isPinned !== right.isPinned) {
+        return left.isPinned ? -1 : 1;
+      }
+      return new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime();
+    });
   const doneWishes = wishes.filter((item) => item.status === "done");
   const homeCards = plannedWishes.filter((item) =>
     homeMode === "places" ? item.category === "place" : item.category === "wish",
@@ -162,6 +204,12 @@ export function RomanticMobileApp() {
       typeof item.latitude === "number" &&
       typeof item.longitude === "number",
   );
+  const visibleMapWishes = mapWishes.filter((item) => {
+    if (mapMode === "all") {
+      return true;
+    }
+    return item.status === mapMode;
+  });
 
   const loadWishes = useCallback(
     async (targetCoupleId: string) => {
@@ -172,13 +220,44 @@ export function RomanticMobileApp() {
       const { data, error } = await supabase
         .from("wishes")
         .select(
-          "id,title,description,category,location_name,external_link,latitude,longitude,status,created_at",
+          "id,title,description,category,location_name,external_link,latitude,longitude,is_pinned,planned_for,status,created_at",
         )
         .eq("couple_id", targetCoupleId)
         .order("created_at", { ascending: false });
 
       if (error) {
         throw error;
+      }
+
+      const wishIds = (data ?? [])
+        .map((item: Record<string, unknown>) => item.id as string)
+        .filter(Boolean);
+      let imageByWishId = new Map<string, string>();
+
+      if (wishIds.length) {
+        const { data: imageRows, error: imageError } = await supabase
+          .from("wish_images")
+          .select("wish_id,storage_path,sort_order")
+          .in("wish_id", wishIds)
+          .order("sort_order", { ascending: true });
+
+        if (imageError) {
+          throw imageError;
+        }
+
+        const nextImageMap = new Map<string, string>();
+        for (const row of (imageRows ?? []) as Record<string, unknown>[]) {
+          const wishId = (row.wish_id as string) ?? "";
+          if (!wishId || nextImageMap.has(wishId)) {
+            continue;
+          }
+
+          const path = (row.storage_path as string) ?? "";
+          const publicUrl = supabase.storage.from("wishes").getPublicUrl(path).data
+            .publicUrl;
+          nextImageMap.set(wishId, publicUrl);
+        }
+        imageByWishId = nextImageMap;
       }
 
       const mapped = (data ?? []).map((item: Record<string, unknown>) => ({
@@ -190,11 +269,15 @@ export function RomanticMobileApp() {
         link: (item.external_link as string) ?? "",
         latitude: (item.latitude as number | null) ?? null,
         longitude: (item.longitude as number | null) ?? null,
+        imageUrl: imageByWishId.get(item.id as string) ?? "",
+        isPinned: (item.is_pinned as boolean) ?? false,
+        plannedFor: (item.planned_for as string | null) ?? null,
         status: (item.status as "planned" | "done") ?? "planned",
         createdAt: (item.created_at as string) ?? new Date().toISOString(),
       }));
 
       setWishes(mapped);
+      setLoadError("");
     },
     [supabase],
   );
@@ -226,6 +309,7 @@ export function RomanticMobileApp() {
       }));
 
       setNotifications(mapped);
+      setLoadError("");
     },
     [supabase],
   );
@@ -249,6 +333,7 @@ export function RomanticMobileApp() {
         (item: Record<string, unknown>) => item.user_id !== activeUserId,
       );
       setPartnerUserId((partner?.user_id as string | undefined) ?? null);
+      setLoadError("");
     },
     [supabase],
   );
@@ -349,6 +434,7 @@ export function RomanticMobileApp() {
       await loadNotifications(targetCoupleId);
       await loadPartner(targetCoupleId, activeUser.id);
     } catch (error) {
+      setLoadError("Не удалось загрузить данные. Проверь соединение и права Supabase.");
       setAuthMessage(
         error instanceof Error
           ? error.message
@@ -358,6 +444,35 @@ export function RomanticMobileApp() {
       setIsLoading(false);
     }
   }, [ensureUserSpace, loadNotifications, loadPartner, loadWishes, supabase]);
+
+  function retryDataSync() {
+    if (!supabase || !coupleId) {
+      return;
+    }
+    setLoadError("");
+    void loadWishes(coupleId);
+    void loadNotifications(coupleId);
+    if (userId) {
+      void loadPartner(coupleId, userId);
+    }
+  }
+
+  function showToast(title: string, tone: ToastItem["tone"] = "info") {
+    const toastId = crypto.randomUUID();
+    setToasts((prev) => [...prev, { id: toastId, title, tone }]);
+    window.setTimeout(() => {
+      setToasts((prev) => prev.filter((item) => item.id !== toastId));
+    }, 2600);
+  }
+
+  async function copyToClipboard(value: string, successMessage: string) {
+    try {
+      await navigator.clipboard.writeText(value);
+      showToast(successMessage, "success");
+    } catch {
+      showToast("Не удалось скопировать автоматически.", "error");
+    }
+  }
 
   useEffect(() => {
     if (!supabase) {
@@ -393,6 +508,33 @@ export function RomanticMobileApp() {
     }
 
     setAuthMessage(description ?? `Ошибка авторизации: ${errorCode}`);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const params = new URLSearchParams(window.location.search);
+    const inviteFromUrl = params.get("invite");
+    if (!inviteFromUrl) {
+      return;
+    }
+
+    setJoinCode(inviteFromUrl);
+    setScreen("profile");
+    const toastId = crypto.randomUUID();
+    setToasts((prev) => [
+      ...prev,
+      {
+        id: toastId,
+        title: "Ссылка-приглашение распознана. Нажми «Присоединиться по коду».",
+        tone: "info",
+      },
+    ]);
+    window.setTimeout(() => {
+      setToasts((prev) => prev.filter((item) => item.id !== toastId));
+    }, 2600);
   }, []);
 
   useEffect(() => {
@@ -447,6 +589,14 @@ export function RomanticMobileApp() {
     };
   }, [coupleId, loadWishes, supabase]);
 
+  useEffect(() => {
+    return () => {
+      if (imagePreviewUrl.startsWith("blob:")) {
+        URL.revokeObjectURL(imagePreviewUrl);
+      }
+    };
+  }, [imagePreviewUrl]);
+
   function resetForm() {
     setForm({
       title: "",
@@ -456,8 +606,20 @@ export function RomanticMobileApp() {
       link: "",
       latitude: "",
       longitude: "",
+      plannedFor: "",
     });
     setFormError("");
+  }
+
+  function onImagePicked(file: File | null) {
+    setImageFile(file);
+    if (!file) {
+      setImagePreviewUrl("");
+      return;
+    }
+
+    const preview = URL.createObjectURL(file);
+    setImagePreviewUrl(preview);
   }
 
   function createWish() {
@@ -489,6 +651,9 @@ export function RomanticMobileApp() {
       link: form.link.trim(),
       latitude: form.latitude.trim() ? Number(form.latitude) : null,
       longitude: form.longitude.trim() ? Number(form.longitude) : null,
+      imageUrl: imagePreviewUrl,
+      isPinned: false,
+      plannedFor: form.plannedFor || null,
       status: "planned",
       createdAt: new Date().toISOString(),
     };
@@ -505,15 +670,20 @@ export function RomanticMobileApp() {
     if (!supabase || !coupleId || !userId) {
       setWishes((prev) => [newWish, ...prev]);
       resetForm();
+      setImageFile(null);
+      setImagePreviewUrl("");
       setScreen("home");
       setHomeMode(form.category === "place" ? "places" : "wishes");
+      showToast("Желание создано.", "success");
       return;
     }
 
     void (async () => {
       setIsLoading(true);
       try {
-        const { error } = await supabase.from("wishes").insert({
+        const { data: insertedWish, error } = await supabase
+          .from("wishes")
+          .insert({
           couple_id: coupleId,
           title,
           description: form.description.trim() || null,
@@ -522,22 +692,91 @@ export function RomanticMobileApp() {
           location_name: form.location.trim() || null,
           latitude: form.latitude.trim() ? Number(form.latitude) : null,
           longitude: form.longitude.trim() ? Number(form.longitude) : null,
+          is_pinned: false,
+          planned_for: form.plannedFor || null,
           status: "planned",
           created_by: userId,
           done_at: null,
-        });
+          })
+          .select("id")
+          .single();
 
         if (error) {
           throw error;
         }
 
+        if (imageFile && insertedWish?.id) {
+          const safeFileName = imageFile.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+          const storagePath = `${coupleId}/${insertedWish.id}/${Date.now()}-${safeFileName}`;
+          const { error: uploadError } = await supabase.storage
+            .from("wishes")
+            .upload(storagePath, imageFile, {
+              upsert: false,
+              contentType: imageFile.type || "image/jpeg",
+            });
+
+          if (uploadError) {
+            throw uploadError;
+          }
+
+          const { error: imageInsertError } = await supabase.from("wish_images").insert({
+            wish_id: insertedWish.id,
+            storage_path: storagePath,
+            sort_order: 0,
+          });
+
+          if (imageInsertError) {
+            throw imageInsertError;
+          }
+        }
+
         await loadWishes(coupleId);
         resetForm();
+        setImageFile(null);
+        setImagePreviewUrl("");
         setScreen("home");
         setHomeMode(form.category === "place" ? "places" : "wishes");
+        showToast("Желание успешно создано.", "success");
       } catch (error) {
         setFormError(
           error instanceof Error ? error.message : "Ошибка создания желания.",
+        );
+        showToast("Не удалось создать желание.", "error");
+      } finally {
+        setIsLoading(false);
+      }
+    })();
+  }
+
+  function togglePinned(id: string) {
+    if (!supabase || !coupleId) {
+      setWishes((prev) =>
+        prev.map((item) =>
+          item.id === id ? { ...item, isPinned: !item.isPinned } : item,
+        ),
+      );
+      return;
+    }
+
+    const target = wishes.find((item) => item.id === id);
+    if (!target) {
+      return;
+    }
+
+    void (async () => {
+      setIsLoading(true);
+      try {
+        const { error } = await supabase
+          .from("wishes")
+          .update({ is_pinned: !target.isPinned })
+          .eq("id", id);
+        if (error) {
+          throw error;
+        }
+        await loadWishes(coupleId);
+      } catch (error) {
+        setAuthMessage(
+          error instanceof Error ? error.message : "Ошибка закрепления желания.",
         );
       } finally {
         setIsLoading(false);
@@ -545,9 +784,20 @@ export function RomanticMobileApp() {
     })();
   }
 
+  function pickRandomWish() {
+    if (!plannedWishes.length) {
+      setInviteMessage("Нет активных желаний для случайного выбора.");
+      return;
+    }
+
+    const randomIndex = Math.floor(Math.random() * plannedWishes.length);
+    setRandomWish(plannedWishes[randomIndex]);
+  }
+
   function deleteWish(id: string) {
     if (!supabase || !coupleId) {
       setWishes((prev) => prev.filter((item) => item.id !== id));
+      showToast("Желание удалено.", "info");
       return;
     }
 
@@ -560,10 +810,12 @@ export function RomanticMobileApp() {
         }
 
         await loadWishes(coupleId);
+        showToast("Желание удалено.", "info");
       } catch (error) {
         setAuthMessage(
           error instanceof Error ? error.message : "Ошибка удаления желания.",
         );
+        showToast("Не удалось удалить желание.", "error");
       } finally {
         setIsLoading(false);
       }
@@ -579,6 +831,7 @@ export function RomanticMobileApp() {
             : item,
         ),
       );
+      showToast("Статус обновлен.", "success");
       return;
     }
 
@@ -605,10 +858,12 @@ export function RomanticMobileApp() {
         }
 
         await loadWishes(coupleId);
+        showToast(nextStatus === "done" ? "Добавлено в «Были»." : "Возвращено в планы.", "success");
       } catch (error) {
         setAuthMessage(
           error instanceof Error ? error.message : "Ошибка обновления статуса.",
         );
+        showToast("Не удалось изменить статус.", "error");
       } finally {
         setIsLoading(false);
       }
@@ -626,6 +881,7 @@ export function RomanticMobileApp() {
   function sendNudge(type: NotificationType, customMessage?: string) {
     if (!supabase || !coupleId || !userId || !partnerUserId) {
       setInviteMessage("Пока нет второго участника пары для уведомлений.");
+      showToast("Сначала свяжите аккаунты через приглашение.", "info");
       return;
     }
 
@@ -651,10 +907,12 @@ export function RomanticMobileApp() {
         if (error) {
           throw error;
         }
+        showToast("Уведомление отправлено партнеру.", "success");
       } catch (error) {
         setInviteMessage(
           error instanceof Error ? error.message : "Не удалось отправить уведомление.",
         );
+        showToast("Не удалось отправить уведомление.", "error");
       } finally {
         setIsLoading(false);
       }
@@ -704,11 +962,18 @@ export function RomanticMobileApp() {
         }
 
         setInviteCode(rawToken);
+        setInviteLink(
+          authRedirectUrl
+            ? `${authRedirectUrl}?invite=${encodeURIComponent(rawToken)}`
+            : "",
+        );
         setInviteMessage("Код приглашения создан. Срок действия: 7 дней.");
+        showToast("Приглашение сгенерировано.", "success");
       } catch (error) {
         setInviteMessage(
           error instanceof Error ? error.message : "Не удалось создать приглашение.",
         );
+        showToast("Ошибка генерации приглашения.", "error");
       } finally {
         setIsLoading(false);
       }
@@ -746,10 +1011,12 @@ export function RomanticMobileApp() {
         await loadWishes(data);
         setJoinCode("");
         setInviteMessage("Ты успешно присоединился(лась) к парному пространству.");
+        showToast("Аккаунты успешно связаны.", "success");
       } catch (error) {
         setInviteMessage(
           error instanceof Error ? error.message : "Ошибка присоединения по коду.",
         );
+        showToast("Не удалось присоединиться по коду.", "error");
       } finally {
         setIsLoading(false);
       }
@@ -778,6 +1045,7 @@ export function RomanticMobileApp() {
 
         if (!error) {
           setAuthMessage("Успешный вход.");
+          showToast("С возвращением! Вход выполнен.", "success");
           return;
         }
 
@@ -798,6 +1066,54 @@ export function RomanticMobileApp() {
         setAuthMessage(
           error instanceof Error ? error.message : "Ошибка входа по паролю.",
         );
+      } finally {
+        setIsLoading(false);
+      }
+    })();
+  }
+
+  function signUpWithPassword() {
+    if (!supabase) {
+      return;
+    }
+
+    setAuthMessage("");
+    setIsLoading(true);
+    void (async () => {
+      try {
+        const cleanEmail = authEmail.trim().toLowerCase();
+        const displayName = authDisplayName.trim();
+        if (!cleanEmail || authPassword.length < 6 || displayName.length < 2) {
+          setAuthMessage("Заполни имя, email и пароль (минимум 6 символов).");
+          return;
+        }
+
+        const { data, error } = await supabase.auth.signUp({
+          email: cleanEmail,
+          password: authPassword,
+          options: {
+            emailRedirectTo: authRedirectUrl,
+            data: {
+              display_name: displayName,
+            },
+          },
+        });
+
+        if (error) {
+          throw error;
+        }
+
+        if (data.user) {
+          showToast("Аккаунт создан! Проверь почту для подтверждения.", "success");
+          setAuthMessage("Регистрация успешна. Подтверди email по ссылке из письма.");
+          setAuthTab("signin");
+          return;
+        }
+      } catch (error) {
+        setAuthMessage(
+          error instanceof Error ? error.message : "Ошибка регистрации.",
+        );
+        showToast("Не удалось зарегистрироваться.", "error");
       } finally {
         setIsLoading(false);
       }
@@ -831,10 +1147,12 @@ export function RomanticMobileApp() {
         }
 
         setAuthMessage("Magic link отправлен на почту.");
+        showToast("Проверь почту: magic link отправлен.", "success");
       } catch (error) {
         setAuthMessage(
           error instanceof Error ? error.message : "Ошибка отправки magic link.",
         );
+        showToast("Не удалось отправить magic link.", "error");
       } finally {
         setIsLoading(false);
       }
@@ -856,39 +1174,107 @@ export function RomanticMobileApp() {
       <div className="mx-auto w-full max-w-3xl">
         <div className="rounded-[28px] border border-white/55 bg-[linear-gradient(160deg,rgba(255,255,255,.72),rgba(255,255,255,.42))] p-4 shadow-[0_24px_80px_rgba(167,139,250,0.28)] backdrop-blur-2xl sm:p-6">
           {isSupabaseEnabled && !userId ? (
-            <section className="space-y-3">
-              <TopBar title="Вход в Our Space" trailing={<UserRound className="h-4 w-4" />} />
-              <Field
-                label="Email"
-                value={authEmail}
-                onChange={(value) => setAuthEmail(value)}
-              />
-              <Field
-                label="Пароль"
-                value={authPassword}
-                onChange={(value) => setAuthPassword(value)}
-                type="password"
-              />
-              <button
-                onClick={signInWithPassword}
-                disabled={isLoading}
-                className="w-full rounded-full bg-[linear-gradient(135deg,#a78bfa,#f9a8d4)] px-4 py-3 text-sm font-semibold text-white disabled:opacity-60"
-              >
-                Войти / зарегистрироваться
-              </button>
-              <button
-                onClick={sendMagicLink}
-                disabled={isLoading}
-                className="w-full rounded-full bg-white/75 px-4 py-3 text-sm font-semibold text-slate-700 disabled:opacity-60"
-              >
-                Отправить magic link
-              </button>
+            <motion.section
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="space-y-4 rounded-[24px] border border-white/60 bg-white/60 p-4 shadow-[0_18px_48px_rgba(167,139,250,0.18)]"
+            >
+              <TopBar title="Добро пожаловать в Our Space" trailing={<UserRound className="h-4 w-4" />} />
+              <div className="grid grid-cols-2 gap-2 rounded-full bg-white/70 p-1">
+                <button
+                  type="button"
+                  onClick={() => setAuthTab("signin")}
+                  className={cn(
+                    "rounded-full px-3 py-2 text-sm font-medium transition",
+                    authTab === "signin"
+                      ? "bg-white text-violet-700 shadow"
+                      : "text-slate-500",
+                  )}
+                >
+                  Вход
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAuthTab("signup")}
+                  className={cn(
+                    "rounded-full px-3 py-2 text-sm font-medium transition",
+                    authTab === "signup"
+                      ? "bg-white text-violet-700 shadow"
+                      : "text-slate-500",
+                  )}
+                >
+                  Регистрация
+                </button>
+              </div>
+
+              <AnimatePresence mode="wait">
+                {authTab === "signin" ? (
+                  <motion.div
+                    key="signin"
+                    initial={{ opacity: 0, x: -8 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    exit={{ opacity: 0, x: 8 }}
+                    className="space-y-3"
+                  >
+                    <Field label="Email" value={authEmail} onChange={setAuthEmail} />
+                    <Field
+                      label="Пароль"
+                      value={authPassword}
+                      onChange={setAuthPassword}
+                      type="password"
+                    />
+                    <button
+                      onClick={signInWithPassword}
+                      disabled={isLoading}
+                      className="w-full rounded-full bg-[linear-gradient(135deg,#a78bfa,#f9a8d4)] px-4 py-3 text-sm font-semibold text-white disabled:opacity-60"
+                    >
+                      Войти
+                    </button>
+                    <button
+                      onClick={sendMagicLink}
+                      disabled={isLoading}
+                      className="w-full rounded-full bg-white/75 px-4 py-3 text-sm font-semibold text-slate-700 disabled:opacity-60"
+                    >
+                      Войти через magic link
+                    </button>
+                  </motion.div>
+                ) : (
+                  <motion.div
+                    key="signup"
+                    initial={{ opacity: 0, x: 8 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    exit={{ opacity: 0, x: -8 }}
+                    className="space-y-3"
+                  >
+                    <Field
+                      label="Имя"
+                      value={authDisplayName}
+                      onChange={setAuthDisplayName}
+                    />
+                    <Field label="Email" value={authEmail} onChange={setAuthEmail} />
+                    <Field
+                      label="Пароль (мин. 6)"
+                      value={authPassword}
+                      onChange={setAuthPassword}
+                      type="password"
+                    />
+                    <button
+                      onClick={signUpWithPassword}
+                      disabled={isLoading}
+                      className="w-full rounded-full bg-[linear-gradient(135deg,#f9a8d4,#a78bfa)] px-4 py-3 text-sm font-semibold text-white disabled:opacity-60"
+                    >
+                      Создать аккаунт
+                    </button>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
               {authMessage ? (
                 <p className="rounded-[16px] bg-white/70 px-4 py-3 text-xs text-slate-600">
                   {authMessage}
                 </p>
               ) : null}
-            </section>
+            </motion.section>
           ) : null}
 
           {!isSupabaseEnabled || userId ? (
@@ -910,6 +1296,18 @@ export function RomanticMobileApp() {
                   `NEXT_PUBLIC_SUPABASE_ANON_KEY` для реального backend.
                 </div>
               )}
+              {loadError ? (
+                <div className="mb-3 flex items-center justify-between gap-3 rounded-[16px] bg-rose-50/90 px-3 py-2 text-xs text-rose-700">
+                  <span>{loadError}</span>
+                  <button
+                    type="button"
+                    onClick={retryDataSync}
+                    className="rounded-full bg-white px-3 py-1 font-medium text-rose-700"
+                  >
+                    Retry
+                  </button>
+                </div>
+              ) : null}
 
           {screen === "home" && (
             <section className="space-y-4">
@@ -1004,24 +1402,66 @@ export function RomanticMobileApp() {
                           whileHover={{ scale: 1.02 }}
                           whileTap={{ scale: 0.99 }}
                           transition={{ duration: 0.22, ease: "easeInOut" }}
-                          className="rounded-[22px] border border-white/50 bg-white/60 p-3 shadow-[0_16px_44px_rgba(167,139,250,0.2)]"
+                          className="cursor-pointer rounded-[22px] border border-white/50 bg-white/60 p-3 shadow-[0_16px_44px_rgba(167,139,250,0.2)]"
+                          onClick={() => setSelectedWish(card)}
                         >
-                          <div className="h-20 rounded-[14px] bg-[linear-gradient(120deg,#a78bfa,#f9a8d4,#93c5fd)]" />
+                          {card.imageUrl ? (
+                            // eslint-disable-next-line @next/next/no-img-element
+                            <img
+                              src={card.imageUrl}
+                              alt={card.title}
+                              className="h-20 w-full rounded-[14px] object-cover"
+                            />
+                          ) : (
+                            <div className="h-20 rounded-[14px] bg-[linear-gradient(120deg,#a78bfa,#f9a8d4,#93c5fd)]" />
+                          )}
                           <div className="mt-2 flex items-center justify-between">
                             <div>
                               <p className="font-semibold text-slate-900">{card.title}</p>
                               <p className="text-xs text-slate-500">
                                 {card.location || card.description || "Новая мечта для двоих"}
                               </p>
+                              {card.plannedFor ? (
+                                <p className="mt-1 text-[11px] text-violet-600">
+                                  План:{" "}
+                                  {new Intl.DateTimeFormat("ru-RU", {
+                                    day: "numeric",
+                                    month: "short",
+                                  }).format(new Date(card.plannedFor))}
+                                </p>
+                              ) : null}
                             </div>
-                            <ChevronRight className="h-4 w-4 text-slate-400" />
+                            <div className="flex items-center gap-1">
+                              {card.isPinned ? (
+                                <span className="rounded-full bg-violet-100 px-2 py-0.5 text-[10px] font-semibold text-violet-700">
+                                  PIN
+                                </span>
+                              ) : null}
+                              <ChevronRight className="h-4 w-4 text-slate-400" />
+                            </div>
                           </div>
                           <div className="mt-3 flex gap-2">
                             <PillButton
                               label="Выполнено ✅"
-                              onClick={() => toggleDone(card.id)}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                toggleDone(card.id);
+                              }}
                             />
-                            <PillButton label="Удалить" onClick={() => deleteWish(card.id)} />
+                            <PillButton
+                              label={card.isPinned ? "Открепить" : "Закрепить"}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                togglePinned(card.id);
+                              }}
+                            />
+                            <PillButton
+                              label="Удалить"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                deleteWish(card.id);
+                              }}
+                            />
                           </div>
                         </motion.article>
                       ))}
@@ -1047,7 +1487,7 @@ export function RomanticMobileApp() {
                 }
               />
               <select
-                className="w-full rounded-[16px] border border-white/50 bg-white/65 px-4 py-3 text-sm text-slate-700 outline-none"
+                className="w-full rounded-[16px] border border-white/50 bg-white/65 px-4 py-3 text-base text-slate-700 outline-none"
                 value={form.category}
                 onChange={(event) =>
                   setForm((prev) => ({
@@ -1081,8 +1521,30 @@ export function RomanticMobileApp() {
                   onChange={(value) => setForm((prev) => ({ ...prev, longitude: value }))}
                 />
               </div>
+              <Field
+                label="Дата (опционально)"
+                type="date"
+                value={form.plannedFor}
+                onChange={(value) => setForm((prev) => ({ ...prev, plannedFor: value }))}
+              />
               <div className="rounded-[18px] border border-dashed border-white/60 bg-white/55 p-4 text-center text-sm text-slate-600">
-                + Загрузить изображение
+                <label className="flex cursor-pointer flex-col items-center gap-2">
+                  <span>+ Загрузить изображение</span>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    onChange={(event) => onImagePicked(event.target.files?.[0] ?? null)}
+                  />
+                </label>
+                {imagePreviewUrl ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={imagePreviewUrl}
+                    alt="preview"
+                    className="mt-3 h-24 w-full rounded-[12px] object-cover"
+                  />
+                ) : null}
               </div>
               {formError ? (
                 <p className="text-xs font-medium text-rose-600">{formError}</p>
@@ -1190,65 +1652,54 @@ export function RomanticMobileApp() {
           {screen === "map" && (
             <section className="space-y-3">
               <TopBar title="Ваши желания" trailing={<MapPin className="h-4 w-4" />} />
-              <div className="relative rounded-[22px] border border-white/50 bg-white/60 p-3 shadow-[0_16px_44px_rgba(167,139,250,0.2)]">
-                <motion.div
-                  animate={{ backgroundPosition: ["0% 0%", "100% 100%", "0% 0%"] }}
-                  transition={{ duration: 18, repeat: Infinity, ease: "linear" }}
-                  className="h-64 rounded-[16px] bg-[linear-gradient(135deg,#f9a8d4,#d8b4fe,#bfdbfe,#f9a8d4)] bg-[length:220%_220%] opacity-75"
-                />
-                {mapWishes.map((item) => {
-                  const point = projectLatLngToCanvas(item.latitude ?? 0, item.longitude ?? 0);
-                  return (
-                    <motion.button
-                      key={item.id}
-                      type="button"
-                      onClick={() => toggleDone(item.id)}
-                      className={cn(
-                        "absolute -translate-x-1/2 -translate-y-1/2 rounded-full p-1",
-                        item.status === "done" ? "text-emerald-500" : "text-pink-500",
-                      )}
-                      style={{ left: `${point.x}%`, top: `${point.y}%` }}
-                      initial={{ scale: 0.8, opacity: 0.85 }}
-                      animate={{ scale: [0.85, 1.1, 0.85], opacity: [0.85, 1, 0.85] }}
-                      transition={{ duration: 2.6, repeat: Infinity }}
-                    >
-                      <MapPin className="h-6 w-6 drop-shadow-[0_6px_8px_rgba(255,255,255,0.5)]" />
-                    </motion.button>
-                  );
-                })}
-                {mapWishes.length === 0 ? (
-                  <motion.div
-                    initial={{ opacity: 0, scale: 0.96 }}
-                    animate={{ opacity: 1, scale: 1 }}
-                    className="absolute inset-x-6 top-12 rounded-[16px] border border-dashed border-white/70 bg-white/70 p-4 text-center backdrop-blur-sm"
+              <div className="flex flex-wrap gap-2">
+                {([
+                  ["all", "Все"],
+                  ["planned", "Хотим"],
+                  ["done", "Были"],
+                ] as const).map(([mode, label]) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => setMapMode(mode)}
+                    className={cn(
+                      "rounded-full px-3 py-1.5 text-xs font-medium",
+                      mapMode === mode
+                        ? "bg-white text-violet-700 shadow"
+                        : "bg-white/70 text-slate-600",
+                    )}
                   >
-                    <motion.div
-                      animate={{ y: [0, -5, 0], opacity: [0.85, 1, 0.85] }}
-                      transition={{ duration: 2.2, repeat: Infinity }}
-                      className="mx-auto mb-2 w-fit text-pink-500"
-                    >
-                      <MapPin className="h-6 w-6" />
-                    </motion.div>
-                    <p className="text-sm font-medium text-slate-800">
-                      Карта пока пустая
-                    </p>
-                    <p className="mt-1 text-xs text-slate-600">
-                      Добавь место и координаты, чтобы появились точки.
-                    </p>
-                  </motion.div>
-                ) : null}
-                <div className="absolute bottom-5 left-5 right-5 rounded-[16px] border border-white/60 bg-white/75 p-3">
-                  <p className="font-semibold text-slate-900">
-                    {mapWishes[0]?.title ?? "Добавь места с координатами"}
-                  </p>
-                  <p className="text-xs text-slate-600">
-                    {mapWishes[0]?.location || "Точки «хотим» и «были» появятся здесь"}
-                  </p>
-                  <p className="mt-2 text-[11px] text-slate-500">
-                    Нажми на пин: переключение между «хотим» и «были».
-                  </p>
-                </div>
+                    {label}
+                  </button>
+                ))}
               </div>
+              <WishesMap
+                points={visibleMapWishes.map((item) => ({
+                  id: item.id,
+                  title: item.title,
+                  location: item.location || "Без названия",
+                  latitude: item.latitude ?? 0,
+                  longitude: item.longitude ?? 0,
+                  status: item.status,
+                }))}
+                onSelect={(id) => {
+                  const found = wishes.find((item) => item.id === id);
+                  if (found) {
+                    setSelectedWish(found);
+                  }
+                }}
+              />
+              {mapWishes[0]?.latitude && mapWishes[0]?.longitude ? (
+                <a
+                  href={`https://www.openstreetmap.org/?mlat=${mapWishes[0].latitude}&mlon=${mapWishes[0].longitude}#map=12/${mapWishes[0].latitude}/${mapWishes[0].longitude}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-2 rounded-full bg-white/75 px-3 py-1.5 text-xs font-medium text-slate-700"
+                >
+                  <ExternalLink className="h-3.5 w-3.5" />
+                  Открыть карту в OSM
+                </a>
+              ) : null}
               <div className="grid grid-cols-2 gap-2 text-xs">
                 <div className="rounded-[14px] bg-white/70 px-3 py-2 text-slate-700">
                   Хотим побывать:{" "}
@@ -1292,7 +1743,7 @@ export function RomanticMobileApp() {
                   </button>
                 </div>
                 <button
-                  onClick={() => sendNudge("custom", "Выбери случайное свидание сегодня 🎲")}
+                  onClick={pickRandomWish}
                   disabled={isLoading || !isSupabaseEnabled}
                   className="mt-3 w-full rounded-full bg-[linear-gradient(135deg,#a78bfa,#f9a8d4)] px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-60"
                 >
@@ -1329,6 +1780,30 @@ export function RomanticMobileApp() {
                       <p className="mt-1 break-all text-sm font-semibold text-slate-800">
                         {inviteCode}
                       </p>
+                      <div className="mt-2 flex gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            copyToClipboard(inviteCode, "Invite-код скопирован.")
+                          }
+                          className="inline-flex items-center gap-1 rounded-full bg-white px-2.5 py-1 text-[11px] font-medium text-slate-700"
+                        >
+                          <Copy className="h-3 w-3" />
+                          Скопировать код
+                        </button>
+                        {inviteLink ? (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              copyToClipboard(inviteLink, "Ссылка-приглашение скопирована.")
+                            }
+                            className="inline-flex items-center gap-1 rounded-full bg-white px-2.5 py-1 text-[11px] font-medium text-slate-700"
+                          >
+                            <Copy className="h-3 w-3" />
+                            Скопировать ссылку
+                          </button>
+                        ) : null}
+                      </div>
                     </div>
                   ) : null}
                   <Field
@@ -1354,10 +1829,164 @@ export function RomanticMobileApp() {
             </section>
           )}
 
+          <AnimatePresence>
+            {randomWish ? (
+              <motion.div
+                className="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/35 p-4 backdrop-blur-sm sm:items-center"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+              >
+                <motion.div
+                  initial={{ opacity: 0, y: 20, scale: 0.96 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: 20, scale: 0.96 }}
+                  className="w-full max-w-sm rounded-[24px] border border-white/60 bg-white/92 p-4 text-center shadow-[0_24px_80px_rgba(15,23,42,0.25)]"
+                >
+                  <motion.div
+                    className="mx-auto mb-3 w-fit text-violet-600"
+                    animate={{ rotate: [0, 12, -12, 0], scale: [1, 1.08, 1] }}
+                    transition={{ duration: 0.6 }}
+                  >
+                    <Dices className="h-7 w-7" />
+                  </motion.div>
+                  <p className="text-sm text-slate-600">Случайный выбор на сегодня</p>
+                  <p className="mt-1 text-xl font-semibold text-slate-900">
+                    {randomWish.title}
+                  </p>
+                  <p className="mt-1 text-sm text-slate-600">
+                    {randomWish.location || randomWish.description || "Новая совместная идея"}
+                  </p>
+                  <div className="mt-4 flex justify-center gap-2">
+                    <PillButton
+                      label="Открыть"
+                      onClick={() => {
+                        setSelectedWish(randomWish);
+                        setRandomWish(null);
+                      }}
+                    />
+                    <PillButton label="Еще" onClick={pickRandomWish} />
+                    <PillButton label="Закрыть" onClick={() => setRandomWish(null)} />
+                  </div>
+                </motion.div>
+              </motion.div>
+            ) : null}
+            {selectedWish ? (
+              <motion.div
+                className="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/35 p-4 backdrop-blur-sm sm:items-center"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+              >
+                <motion.div
+                  initial={{ opacity: 0, y: 16, scale: 0.98 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: 16, scale: 0.98 }}
+                  className="w-full max-w-md rounded-[24px] border border-white/60 bg-white/90 p-4 shadow-[0_24px_80px_rgba(15,23,42,0.25)]"
+                >
+                  <div className="mb-3 flex items-center justify-between">
+                    <p className="text-lg font-semibold text-slate-900">{selectedWish.title}</p>
+                    <button
+                      type="button"
+                      className="rounded-full bg-white/80 p-2 text-slate-600"
+                      onClick={() => setSelectedWish(null)}
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  </div>
+                  {selectedWish.imageUrl ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      src={selectedWish.imageUrl}
+                      alt={selectedWish.title}
+                      className="h-44 w-full rounded-[14px] object-cover"
+                    />
+                  ) : (
+                    <div className="h-44 w-full rounded-[14px] bg-[linear-gradient(120deg,#a78bfa,#f9a8d4,#93c5fd)]" />
+                  )}
+                  <div className="mt-3 space-y-2 text-sm text-slate-700">
+                    <p>{selectedWish.description || "Описание пока не добавлено."}</p>
+                    <p>
+                      <span className="font-medium">Локация:</span>{" "}
+                      {selectedWish.location || "Не указана"}
+                    </p>
+                    <p>
+                      <span className="font-medium">Статус:</span>{" "}
+                      {selectedWish.status === "done" ? "Уже были" : "Хотим побывать"}
+                    </p>
+                    {selectedWish.plannedFor ? (
+                      <p>
+                        <span className="font-medium">Дата:</span>{" "}
+                        {new Intl.DateTimeFormat("ru-RU", {
+                          day: "numeric",
+                          month: "long",
+                        }).format(new Date(selectedWish.plannedFor))}
+                      </p>
+                    ) : null}
+                    {selectedWish.link ? (
+                      <a
+                        href={selectedWish.link}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1 text-violet-700"
+                      >
+                        <ExternalLink className="h-3.5 w-3.5" />
+                        Открыть ссылку
+                      </a>
+                    ) : null}
+                  </div>
+                  <div className="mt-4 flex flex-wrap gap-2">
+                    <PillButton
+                      label={
+                        selectedWish.status === "done"
+                          ? "Вернуть в планы"
+                          : "Отметить как done"
+                      }
+                      onClick={() => {
+                        toggleDone(selectedWish.id);
+                        setSelectedWish(null);
+                      }}
+                    />
+                    <PillButton
+                      label="Удалить"
+                      onClick={() => {
+                        deleteWish(selectedWish.id);
+                        setSelectedWish(null);
+                      }}
+                    />
+                  </div>
+                </motion.div>
+              </motion.div>
+            ) : null}
+          </AnimatePresence>
+
           <BottomNav screen={screen} setScreen={setScreen} />
             </>
           ) : null}
         </div>
+      </div>
+      <div className="pointer-events-none fixed inset-x-0 top-3 z-[60] mx-auto flex w-full max-w-md flex-col gap-2 px-4">
+        <AnimatePresence>
+          {toasts.map((toast) => (
+            <motion.div
+              key={toast.id}
+              initial={{ opacity: 0, y: -14, scale: 0.96 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: -10, scale: 0.96 }}
+              className={cn(
+                "pointer-events-auto rounded-2xl border px-4 py-3 text-sm shadow-[0_16px_40px_rgba(15,23,42,0.15)] backdrop-blur-xl",
+                toast.tone === "success" &&
+                  "border-emerald-200 bg-emerald-50/90 text-emerald-800",
+                toast.tone === "error" &&
+                  "border-rose-200 bg-rose-50/90 text-rose-800",
+                toast.tone === "info" &&
+                  "border-violet-200 bg-white/90 text-slate-700",
+              )}
+            >
+              {toast.title}
+            </motion.div>
+          ))}
+        </AnimatePresence>
       </div>
     </main>
   );
@@ -1381,7 +2010,7 @@ function Field({
   label: string;
   value?: string;
   onChange?: (value: string) => void;
-  type?: "text" | "password";
+  type?: "text" | "password" | "date";
 }) {
   return (
     <input
@@ -1389,12 +2018,18 @@ function Field({
       value={value}
       onChange={(event) => onChange?.(event.target.value)}
       placeholder={label}
-      className="w-full rounded-[16px] border border-white/50 bg-white/65 px-4 py-3 text-sm text-slate-700 outline-none placeholder:text-slate-500"
+      className="w-full rounded-[16px] border border-white/50 bg-white/65 px-4 py-3 text-base text-slate-700 outline-none placeholder:text-slate-500"
     />
   );
 }
 
-function PillButton({ label, onClick }: { label: string; onClick?: () => void }) {
+function PillButton({
+  label,
+  onClick,
+}: {
+  label: string;
+  onClick?: (event: React.MouseEvent<HTMLButtonElement>) => void;
+}) {
   return (
     <motion.button
       onClick={onClick}
